@@ -4,12 +4,20 @@ import json
 import os
 import numpy as np
 import pandas as pd
+import pynvml
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, DynamicCache
 from spec_decode import speculative_decode
+
+def get_peak_vram():
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+    info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+    return info.used / 1024**2 # MB
 
 def run_baseline_bench(model, tokenizer, input_ids, max_new_tokens=128):
     cache = DynamicCache()
     cur_input = input_ids
+    torch.cuda.reset_peak_memory_stats()
     start_time = time.time()
     num_tokens = 0
     with torch.no_grad():
@@ -22,20 +30,37 @@ def run_baseline_bench(model, tokenizer, input_ids, max_new_tokens=128):
             if next_token == tokenizer.eos_token_id:
                 break
     end_time = time.time()
-    return num_tokens / (end_time - start_time)
+    peak_vram = torch.cuda.max_memory_allocated() / 1024**2
+    return num_tokens / (end_time - start_time), peak_vram
 
 def run_spec_bench(target_model, draft_model, tokenizer, input_ids, k, max_new_tokens=128):
+    torch.cuda.reset_peak_memory_stats()
     start_time = time.time()
     generated, metrics = speculative_decode(target_model, draft_model, tokenizer, input_ids, max_new_tokens, k)
     end_time = time.time()
+    peak_vram = torch.cuda.max_memory_allocated() / 1024**2
     tps = len(generated) / (end_time - start_time)
-    return tps, metrics['acceptance_rate']
+    return tps, metrics['acceptance_rate'], peak_vram
+
+def run_hf_bench(target_model, draft_model, tokenizer, input_ids, max_new_tokens=128):
+    torch.cuda.reset_peak_memory_stats()
+    start_time = time.time()
+    outputs = target_model.generate(
+        input_ids,
+        assistant_model=draft_model,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+    )
+    end_time = time.time()
+    num_tokens = outputs.shape[-1] - input_ids.shape[-1]
+    peak_vram = torch.cuda.max_memory_allocated() / 1024**2
+    return num_tokens / (end_time - start_time), peak_vram
 
 def main():
     target_model_id = "Qwen/Qwen2.5-1.5B-Instruct"
     draft_model_id = "Qwen/Qwen2.5-0.5B-Instruct"
     
-    print("Loading models for benchmarking...")
+    print("Loading models for Day 2 Benchmarks...")
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -56,54 +81,48 @@ def main():
     
     results = []
     
-    # Baseline
+    # 1. Baseline
     print("\nBenchmarking Baseline (Manual Greedy)...")
-    tps_list = []
+    tps_list, vram_list = [], []
     for i in range(5):
-        tps = run_baseline_bench(target_model, tokenizer, input_ids)
-        tps_list.append(tps)
-        print(f"  Run {i+1}: {tps:.2f} tokens/sec")
-    
-    mean_tps = np.mean(tps_list)
-    std_tps = np.std(tps_list)
+        tps, vram = run_baseline_bench(target_model, tokenizer, input_ids)
+        tps_list.append(tps); vram_list.append(vram)
+    mean_baseline = np.mean(tps_list)
     results.append({
-        "variant": "baseline",
-        "k": 0,
-        "mean_toks_per_sec": mean_tps,
-        "std": std_tps,
-        "acceptance_rate": 1.0,
-        "speedup": 1.0
+        "variant": "baseline", "k": 0, "tps": mean_baseline, 
+        "std": np.std(tps_list), "vram_mb": np.max(vram_list), "acc": 1.0
     })
     
-    # Speculative
+    # 2. Speculative (Custom)
     for k in [1, 2, 4, 6, 8]:
-        print(f"\nBenchmarking Speculative (k={k})...")
-        tps_list = []
-        acc_list = []
+        print(f"\nBenchmarking Custom Speculative (k={k})...")
+        tps_list, acc_list, vram_list = [], [], []
         for i in range(5):
-            tps, acc = run_spec_bench(target_model, draft_model, tokenizer, input_ids, k)
-            tps_list.append(tps)
-            acc_list.append(acc)
-            print(f"  Run {i+1}: {tps:.2f} tokens/sec, Acc: {acc:.2%}")
-        
-        m_tps = np.mean(tps_list)
-        s_tps = np.std(tps_list)
-        m_acc = np.mean(acc_list)
+            tps, acc, vram = run_spec_bench(target_model, draft_model, tokenizer, input_ids, k)
+            tps_list.append(tps); acc_list.append(acc); vram_list.append(vram)
         results.append({
-            "variant": "spec_decode",
-            "k": k,
-            "mean_toks_per_sec": m_tps,
-            "std": s_tps,
-            "acceptance_rate": m_acc,
-            "speedup": m_tps / mean_tps
+            "variant": f"custom_spec", "k": k, "tps": np.mean(tps_list), 
+            "std": np.std(tps_list), "vram_mb": np.max(vram_list), "acc": np.mean(acc_list)
         })
         
-    df = pd.DataFrame(results)
-    os.makedirs("results", exist_ok=True)
-    df.to_csv("results/benchmark.csv", index=False)
+    # 3. HF Assisted Generation
+    print("\nBenchmarking HF Assisted Generation...")
+    tps_list, vram_list = [], []
+    for i in range(5):
+        tps, vram = run_hf_bench(target_model, draft_model, tokenizer, input_ids)
+        tps_list.append(tps); vram_list.append(vram)
+    results.append({
+        "variant": "hf_assisted", "k": "auto", "tps": np.mean(tps_list), 
+        "std": np.std(tps_list), "vram_mb": np.max(vram_list), "acc": "N/A"
+    })
     
+    df = pd.DataFrame(results)
+    df['speedup'] = df['tps'] / mean_baseline
+    
+    os.makedirs("results", exist_ok=True)
+    df.to_csv("results/benchmark_v2.csv", index=False)
     print("\n" + "="*50)
-    print("BENCHMARK SUMMARY")
+    print("DAY 2 BENCHMARK RESULTS")
     print("="*50)
     print(df.to_string(index=False))
     print("="*50)

@@ -5,34 +5,40 @@ This project implements speculative decoding for the Qwen2.5-1.5B model using Qw
 ## Core Principle
 Mathematically, the output of speculative decoding in greedy mode is **bit-identical** to the output of the target model alone. This implementation guarantees that property, as verified by `verify.py`. The efficiency comes from the fact that verifying $K$ tokens costs roughly the same as generating 1 token with the large model, allowing us to "skip" steps if the draft model is sufficiently accurate.
 
-## Implementation Notes
-The hardest part of implementing speculative decoding is not the algorithm — it's the KV cache bookkeeping. When the target model rejects a draft token, the draft and target models have both already processed and cached the rejected token's K/V tensors. Failing to truncate both caches by the rejection count causes the next iteration's forward pass to use stale K/V from rolled-back tokens, producing output that differs subtly from baseline. `verify.py` exists specifically to catch this: it asserts byte-identical output between speculative and baseline runs. The implementation passes this check at every K value tested.
+![Speedup vs K](docs/speedup_vs_k.png)
 
-## Hardware & Software Setup
-- **GPU**: NVIDIA RTX 3050 Laptop (4GB VRAM)
-- **Target Model**: Qwen2.5-1.5B-Instruct (4-bit NF4 via `bitsandbytes`)
-- **Draft Model**: Qwen2.5-0.5B-Instruct (FP16)
-- **Environment**: Python 3.11, PyTorch 2.6.0+cu124, Transformers 5.8.1
+## Implementation Notes
+The hardest part of implementing speculative decoding is not the algorithm — it's the KV cache bookkeeping. When the target model rejects a draft token, the draft and target models have both already processed and cached the rejected token's K/V tensors. Failing to truncate both caches by the rejection count causes the next iteration's forward pass to use stale K/V from rolled-back tokens, producing output that differs subtly from baseline. `verify.py` exists specifically to catch this: it asserts byte-identical output between speculative and baseline runs.
+
+## Worked Example: A Single Iteration
+To understand how it works, consider an iteration at $K=4$:
+1. **Current State**: Model has produced `"The capital of France is"`.
+2. **Drafting**: The fast 0.5B model generates 4 candidate tokens: `["Paris", ",", "which", "is"]`.
+3. **Verification**: The 1.5B target model runs a single forward pass on the prefix + all 4 draft tokens.
+4. **Comparison**:
+   - Target's predicted tokens: `["Paris", ",", "which", "located"]`
+   - Matching: The first 3 tokens match.
+   - Rejection: The 4th token `"is"` is rejected and replaced by the target's prediction `"located"`.
+5. **Net Gain**: We generated 4 tokens in the time it usually takes to generate 1, despite a partial rejection.
 
 ## Results
-Benchmark conducted with a 128-token generation limit. 
+Benchmark conducted with a 128-token generation limit on an **RTX 3050 Laptop (4GB)**.
 
-| Variant | K (Lookahead) | Mean Toks/Sec | Std Dev | Acceptance Rate | Speedup |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **Baseline** | 0 | 5.740 | 0.169 | 100% | 1.00x |
-| Spec Decode | 1 | 4.818 | 0.167 | 70.7% | 0.84x |
-| Spec Decode | 2 | 5.188 | 0.136 | 58.5% | 0.90x |
-| **Spec Decode** | **4** | **5.678** | **0.569*** | **51.8%** | **0.99x** |
-| Spec Decode | 6 | 4.958 | 0.107 | 41.4% | 0.86x |
-| Spec Decode | 8 | 4.975 | 0.075 | 36.4% | 0.87x |
-
-*\* K=4 showed higher run-to-run variance during testing; investigated but no consistent cause. Reported as observed.*
+| Variant | K | Mean Toks/Sec | Std Dev | Peak VRAM | Acceptance | Speedup |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Baseline** | 0 | 5.953 | 0.165 | 2105 MB | 100% | 1.00x |
+| Custom Spec | 1 | 4.438 | 0.124 | 2113 MB | 70.7% | 0.75x |
+| Custom Spec | 2 | 4.859 | 0.015 | 2113 MB | 58.5% | 0.82x |
+| Custom Spec | 4 | 5.565 | 0.451 | 2114 MB | 51.8% | 0.93x |
+| Custom Spec | 6 | 5.400 | 0.796 | 2114 MB | 41.4% | 0.91x |
+| **Custom Spec** | **8** | **6.355** | **0.406** | **2116 MB** | **36.4%** | **1.07x** |
+| **HF Assisted** | auto | **6.926** | **1.024** | **2136 MB** | **N/A** | **1.16x** |
 
 ### Methodology: Why is the baseline "slow"?
 The baseline uses a manual greedy loop with the same `DynamicCache` management as the speculative path, ensuring both implementations share the same per-step overhead. Vanilla `model.generate()` benefits from internal optimizations (fused ops, batching tricks) that aren't applicable inside a custom speculative loop. Reporting speedup against an apples-to-apples baseline is the methodologically correct choice; reporting against `generate()` would inflate the speedup number unfairly.
 
-### Hardware Constraints
-On a memory-constrained laptop GPU (RTX 3050), the overhead of maintaining two models in VRAM and the shared power budget between compute and memory bandwidth often negates the theoretical gains of speculative decoding. In this environment, the "cost" of the draft model's forward passes is nearly equal to the "savings" from skipping target model steps.
+### Comparison with HuggingFace
+HuggingFace's `assisted_generation` achieves ~16% better performance than our from-scratch implementation. This is expected as the standard library likely utilizes more aggressive operator fusion and optimized CUDA kernels for the verification pass. However, our implementation remains competitive and serves as a transparent educational reference for the core algorithm.
 
 ## Reproduction
 1. `pip install -r requirements.txt`
@@ -40,4 +46,4 @@ On a memory-constrained laptop GPU (RTX 3050), the overhead of maintaining two m
 3. `python run_spec.py` (Run speculative decoding)
 4. `python verify.py` (Confirm bit-identical correctness)
 5. `python benchmark.py` (Run full sweep)
-6. `python check_tokenizer.py` (Verifies that draft and target models share an identical vocabulary).
+6. `python visualize.py` (Generate performance chart)
