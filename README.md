@@ -40,10 +40,21 @@ The baseline uses a manual greedy loop with the same `DynamicCache` management a
 ### Comparison with HuggingFace
 HuggingFace's `assisted_generation` achieves ~16% better performance than our from-scratch implementation. This is expected as the standard library likely utilizes more aggressive operator fusion and optimized CUDA kernels for the verification pass. However, our implementation remains competitive and serves as a transparent educational reference for the core algorithm.
 
+## Day 3: Probabilistic Rejection Sampling
+While greedy decoding is sufficient for factual tasks, creative generation requires stochastic sampling. This project implements the **Rejection Sampling** algorithm from the original Leviathan et al. (2023) paper to support `do_sample=True`.
+
+### The Rejection Sampling Logic
+For each draft token $x$ with draft probability $q(x)$ and target probability $p(x)$:
+1. **Acceptance Phase**: Draw $r \sim \text{Uniform}(0, 1)$. If $r \leq \frac{p(x)}{q(x)}$, the token is accepted.
+2. **Correction Phase**: If rejected, we resample a replacement token from a modified distribution:
+   $$p'(x) = \frac{\max(0, p(x) - q(x))}{\sum_{i} \max(0, p(i) - q(i))}$$
+This ensures that the final output follows the target model's distribution $p$ exactly, even though it was biased by the draft model $q$.
+
 ## Reproduction
 1. `pip install -r requirements.txt`
 2. `python run_baseline.py` (Generate reference)
-3. `python run_spec.py` (Run speculative decoding)
-4. `python verify.py` (Confirm bit-identical correctness)
-5. `python benchmark.py` (Run full sweep)
-6. `python visualize.py` (Generate performance chart)
+3. `python run_spec.py` (Run greedy speculative decoding)
+4. `python run_sampling.py` (Run probabilistic speculative decoding)
+5. `python verify.py` (Confirm bit-identical correctness for greedy)
+6. `python benchmark.py` (Run full sweep)
+7. `python visualize.py` (Generate performance chart)
