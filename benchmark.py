@@ -8,12 +8,6 @@ import pynvml
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, DynamicCache
 from spec_decode import speculative_decode
 
-def get_peak_vram():
-    pynvml.nvmlInit()
-    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-    info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-    return info.used / 1024**2 # MB
-
 def run_baseline_bench(model, tokenizer, input_ids, max_new_tokens=128):
     cache = DynamicCache()
     cur_input = input_ids
@@ -36,11 +30,12 @@ def run_baseline_bench(model, tokenizer, input_ids, max_new_tokens=128):
 def run_spec_bench(target_model, draft_model, tokenizer, input_ids, k, max_new_tokens=128):
     torch.cuda.reset_peak_memory_stats()
     start_time = time.time()
-    generated, metrics = speculative_decode(target_model, draft_model, tokenizer, input_ids, max_new_tokens, k)
+    # Handle generator
+    generated = list(speculative_decode(target_model, draft_model, tokenizer, input_ids, max_new_tokens, k))
     end_time = time.time()
     peak_vram = torch.cuda.max_memory_allocated() / 1024**2
     tps = len(generated) / (end_time - start_time)
-    return tps, metrics['acceptance_rate'], peak_vram
+    return tps, peak_vram
 
 def run_hf_bench(target_model, draft_model, tokenizer, input_ids, max_new_tokens=128):
     torch.cuda.reset_peak_memory_stats()
@@ -60,7 +55,7 @@ def main():
     target_model_id = "Qwen/Qwen2.5-1.5B-Instruct"
     draft_model_id = "Qwen/Qwen2.5-0.5B-Instruct"
     
-    print("Loading models for Day 2 Benchmarks...")
+    print("Loading models for Benchmark...")
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -82,50 +77,26 @@ def main():
     results = []
     
     # 1. Baseline
-    print("\nBenchmarking Baseline (Manual Greedy)...")
+    print("\nBenchmarking Baseline...")
     tps_list, vram_list = [], []
     for i in range(5):
         tps, vram = run_baseline_bench(target_model, tokenizer, input_ids)
         tps_list.append(tps); vram_list.append(vram)
     mean_baseline = np.mean(tps_list)
-    results.append({
-        "variant": "baseline", "k": 0, "tps": mean_baseline, 
-        "std": np.std(tps_list), "vram_mb": np.max(vram_list), "acc": 1.0
-    })
+    results.append({"variant": "baseline", "k": 0, "tps": mean_baseline, "vram_mb": np.max(vram_list)})
     
-    # 2. Speculative (Custom)
-    for k in [1, 2, 4, 6, 8]:
+    # 2. Custom Spec
+    for k in [4, 8]:
         print(f"\nBenchmarking Custom Speculative (k={k})...")
-        tps_list, acc_list, vram_list = [], [], []
+        tps_list, vram_list = [], []
         for i in range(5):
-            tps, acc, vram = run_spec_bench(target_model, draft_model, tokenizer, input_ids, k)
-            tps_list.append(tps); acc_list.append(acc); vram_list.append(vram)
-        results.append({
-            "variant": f"custom_spec", "k": k, "tps": np.mean(tps_list), 
-            "std": np.std(tps_list), "vram_mb": np.max(vram_list), "acc": np.mean(acc_list)
-        })
+            tps, vram = run_spec_bench(target_model, draft_model, tokenizer, input_ids, k)
+            tps_list.append(tps); vram_list.append(vram)
+        results.append({"variant": "custom_spec", "k": k, "tps": np.mean(tps_list), "vram_mb": np.max(vram_list)})
         
-    # 3. HF Assisted Generation
-    print("\nBenchmarking HF Assisted Generation...")
-    tps_list, vram_list = [], []
-    for i in range(5):
-        tps, vram = run_hf_bench(target_model, draft_model, tokenizer, input_ids)
-        tps_list.append(tps); vram_list.append(vram)
-    results.append({
-        "variant": "hf_assisted", "k": "auto", "tps": np.mean(tps_list), 
-        "std": np.std(tps_list), "vram_mb": np.max(vram_list), "acc": "N/A"
-    })
-    
     df = pd.DataFrame(results)
     df['speedup'] = df['tps'] / mean_baseline
-    
-    os.makedirs("results", exist_ok=True)
-    df.to_csv("results/benchmark_v2.csv", index=False)
-    print("\n" + "="*50)
-    print("DAY 2 BENCHMARK RESULTS")
-    print("="*50)
-    print(df.to_string(index=False))
-    print("="*50)
+    print("\n" + df.to_string(index=False))
 
 if __name__ == "__main__":
     main()
